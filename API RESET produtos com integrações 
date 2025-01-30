@@ -1,0 +1,273 @@
+// services/mercadopago.js
+const mercadopago = require('mercadopago');
+const config = require('../config');
+
+mercadopago.configure({
+    access_token: config.mercadoPagoAccessToken
+});
+
+const createPayment = async (order) => {
+    const preference = {
+        items: order.items.map(item => ({
+            title: item.produto.nome,
+            unit_price: item.produto.preco,
+            quantity: item.quantidade,
+            currency_id: 'BRL',
+            picture_url: item.produto.imagens[0]?.url
+        })),
+        external_reference: order._id.toString(),
+        back_urls: {
+            success: `${config.frontendUrl}/pedido/sucesso`,
+            failure: `${config.frontendUrl}/pedido/falha`,
+            pending: `${config.frontendUrl}/pedido/pendente`
+        },
+        auto_return: 'approved',
+        notification_url: `${config.apiUrl}/webhooks/mercadopago`
+    };
+
+    return await mercadopago.preferences.create(preference);
+};
+
+// services/correios.js
+const { calcularPrecoPrazo } = require('correios-brasil');
+
+const calcularFrete = async (dados) => {
+    const parametros = {
+        sCepOrigem: config.cepOrigem,
+        sCepDestino: dados.cepDestino,
+        nVlPeso: dados.peso,
+        nCdFormato: '1', // 1 - Caixa/Pacote
+        nVlComprimento: dados.comprimento,
+        nVlAltura: dados.altura,
+        nVlLargura: dados.largura,
+        nCdServico: ['04014', '04510'], // SEDEX e PAC
+        nVlDiametro: '0'
+    };
+
+    return await calcularPrecoPrazo(parametros);
+};
+
+// services/notifications.js
+const webpush = require('web-push');
+const Usuario = require('../models/Usuario');
+
+webpush.setVapidDetails(
+    'mailto:seu-email@exemplo.com',
+    config.vapidPublicKey,
+    config.vapidPrivateKey
+);
+
+const sendPushNotification = async (userId, notification) => {
+    const usuario = await Usuario.findById(userId);
+    if (usuario.pushSubscription) {
+        try {
+            await webpush.sendNotification(
+                usuario.pushSubscription,
+                JSON.stringify(notification)
+            );
+        } catch (error) {
+            logger.error('Erro ao enviar push notification:', error);
+        }
+    }
+};
+
+// services/analytics.js
+const { google } = require('googleapis');
+const analytics = google.analytics('v3');
+
+const jwtClient = new google.auth.JWT(
+    config.googleAnalyticsEmail,
+    null,
+    config.googleAnalyticsPrivateKey,
+    ['https://www.googleapis.com/auth/analytics.readonly']
+);
+
+const trackEvent = async (category, action, label, value) => {
+    const visitor = await analytics.visitors.insert({
+        auth: jwtClient,
+        userActivity: {
+            sessionId: '1',
+            activityType: 'EVENT',
+            eventInfo: {
+                eventCategory: category,
+                eventAction: action,
+                eventLabel: label,
+                eventValue: value
+            }
+        }
+    });
+    return visitor.data;
+};
+
+// models/Pedido.js
+const pedidoSchema = new mongoose.Schema({
+    usuario: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Usuario',
+        required: true
+    },
+    items: [{
+        produto: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Produto',
+            required: true
+        },
+        quantidade: {
+            type: Number,
+            required: true
+        },
+        preco: Number
+    }],
+    total: Number,
+    status: {
+        type: String,
+        enum: ['pendente', 'pago', 'enviado', 'entregue', 'cancelado'],
+        default: 'pendente'
+    },
+    pagamento: {
+        id: String,
+        status: String,
+        metodo: String
+    },
+    frete: {
+        servico: String,
+        codigo_rastreio: String,
+        valor: Number,
+        prazo: Number
+    },
+    endereco: {
+        cep: String,
+        rua: String,
+        numero: String,
+        complemento: String,
+        bairro: String,
+        cidade: String,
+        estado: String
+    },
+    dataCriacao: {
+        type: Date,
+        default: Date.now
+    }
+});
+
+const Pedido = mongoose.model('Pedido', pedidoSchema);
+
+// routes/pedidos.js
+app.post('/pedidos', auth, async (req, res) => {
+    try {
+        // 1. Criar pedido
+        const pedido = new Pedido({
+            usuario: req.userId,
+            items: req.body.items,
+            endereco: req.body.endereco
+        });
+
+        // 2. Calcular frete
+        const produtos = await Promise.all(
+            pedido.items.map(item => Produto.findById(item.produto))
+        );
+
+        const dadosFrete = {
+            cepDestino: pedido.endereco.cep,
+            peso: produtos.reduce((total, p, i) => 
+                total + (p.peso * pedido.items[i].quantidade), 0),
+            comprimento: Math.max(...produtos.map(p => p.dimensoes.comprimento)),
+            altura: Math.max(...produtos.map(p => p.dimensoes.altura)),
+            largura: Math.max(...produtos.map(p => p.dimensoes.largura))
+        };
+
+        const opcoesFrete = await calcularFrete(dadosFrete);
+        pedido.frete = {
+            servico: req.body.servicoFrete,
+            valor: opcoesFrete.find(f => f.Codigo === req.body.servicoFrete).Valor
+        };
+
+        // 3. Calcular total
+        pedido.total = pedido.items.reduce((total, item) => 
+            total + (item.quantidade * produtos.find(p => 
+                p._id.toString() === item.produto.toString()
+            ).preco), 0) + pedido.frete.valor;
+
+        // 4. Criar preferência de pagamento
+        const preference = await createPayment(pedido);
+        
+        // 5. Salvar pedido
+        await pedido.save();
+
+        // 6. Enviar notificação
+        await sendPushNotification(req.userId, {
+            title: 'Novo Pedido Criado',
+            body: `Seu pedido #${pedido._id} foi criado com sucesso!`
+        });
+
+        // 7. Registrar evento no Analytics
+        await trackEvent('Pedido', 'Criação', pedido._id.toString(), pedido.total);
+
+        res.status(201).json({
+            pedido,
+            paymentUrl: preference.body.init_point
+        });
+    } catch (error) {
+        logger.error('Erro ao criar pedido:', error);
+        res.status(400).json({ message: error.message });
+    }
+});
+
+// Webhook do Mercado Pago
+app.post('/webhooks/mercadopago', async (req, res) => {
+    try {
+        const payment = req.body;
+        if (payment.type === 'payment') {
+            const paymentInfo = await mercadopago.payment.findById(payment.data.id);
+            const pedido = await Pedido.findById(paymentInfo.external_reference);
+
+            if (paymentInfo.status === 'approved') {
+                pedido.status = 'pago';
+                pedido.pagamento = {
+                    id: payment.data.id,
+                    status: 'approved',
+                    metodo: paymentInfo.payment_method_id
+                };
+
+                await pedido.save();
+
+                // Enviar notificação
+                await sendPushNotification(pedido.usuario, {
+                    title: 'Pagamento Confirmado',
+                    body: `Seu pagamento do pedido #${pedido._id} foi confirmado!`
+                });
+
+                // Registrar evento no Analytics
+                await trackEvent('Pagamento', 'Aprovado', pedido._id.toString(), pedido.total);
+            }
+        }
+        res.sendStatus(200);
+    } catch (error) {
+        logger.error('Erro no webhook do Mercado Pago:', error);
+        res.sendStatus(500);
+    }
+});
+
+// Atualização de rastreamento
+app.post('/pedidos/:id/rastreio', auth, isAdmin, async (req, res) => {
+    try {
+        const pedido = await Pedido.findById(req.params.id);
+        pedido.frete.codigo_rastreio = req.body.codigo;
+        pedido.status = 'enviado';
+        await pedido.save();
+
+        // Enviar notificação
+        await sendPushNotification(pedido.usuario, {
+            title: 'Pedido Enviado',
+            body: `Seu pedido #${pedido._id} foi enviado! Rastreio: ${req.body.codigo}`
+        });
+
+        // Registrar evento no Analytics
+        await trackEvent('Pedido', 'Envio', pedido._id.toString());
+
+        res.json(pedido);
+    } catch (error) {
+        logger.error('Erro ao atualizar rastreio:', error);
+        res.status(400).json({ message: error.message });
+    }
+});
